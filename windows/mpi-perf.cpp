@@ -16,21 +16,16 @@
 
 int world_size, world_rank, node_local_rank;
 
-void print_usage()
+struct node_info
 {
-    fprintf(stderr, "Usage: <program> \n\
-		    -f <group1-hosts>\n\
-		    -n <group1-size> \n\
-		    -d <use-dotnet 0|1>\n\
-		    -p <ppn> \n -i <iters>\n\
-		    -b <buffer-size>\n\
-		    -u <uni-directional (MPI-only) 0|1>\n\
-		    -r <number-of-runs>\n\
-		    -l <logfolder>\n\
-		    -x <use non-blocking MPI calls>");
-}
+    int group_id;
+    int group_rank;
+    int rank;
+    char hostname[MAX_HOST_SZ];
+    char ipaddress[MAX_HOST_SZ];
+};
 
-int strnicmpL(const char* s1, const char* s2, size_t n)
+int my_strnicmp(const char* s1, const char* s2, size_t n)
 {
     int result = 0;
     for (size_t i = 0; i < n; i++)
@@ -62,22 +57,23 @@ do {                                                             \
    assert(MPI_SUCCESS == mpi_errno);                             \
 } while (0)
 
-void do_mpi_benchmark_unidir(int my_group, int my_rank, int peer_rank, char* peer_host, char* my_host,
+
+void do_mpi_benchmark_unidir(struct node_info *my_node_info, struct node_info *peer_node_info,
     int iters, void* buffer_tx, void* buffer_rx, int buff_len)
 {
     MPI_Status status;
 
     for (int i = 0; i < iters; i++)
     {
-        if (my_group == 1)
+        if (my_node_info->group_id == 1)
         {
-            MPI_CHECK(MPI_Send(buffer_tx, buff_len, MPI_CHAR, peer_rank, 1, MPI_COMM_WORLD));
-            MPI_CHECK(MPI_Recv(buffer_rx, 1, MPI_CHAR, peer_rank, 2, MPI_COMM_WORLD, &status));
+            MPI_CHECK(MPI_Send(buffer_tx, buff_len, MPI_CHAR, peer_node_info->rank, 1, MPI_COMM_WORLD));
+            MPI_CHECK(MPI_Recv(buffer_rx, 1, MPI_CHAR, peer_node_info->rank, 2, MPI_COMM_WORLD, &status));
         }
         else
         {
-            MPI_CHECK(MPI_Recv(buffer_rx, buff_len, MPI_CHAR, peer_rank, 1, MPI_COMM_WORLD, &status));
-            MPI_CHECK(MPI_Send(buffer_tx, 1, MPI_CHAR, peer_rank, 2, MPI_COMM_WORLD));
+            MPI_CHECK(MPI_Recv(buffer_rx, buff_len, MPI_CHAR, peer_node_info->rank, 1, MPI_COMM_WORLD, &status));
+            MPI_CHECK(MPI_Send(buffer_tx, 1, MPI_CHAR, peer_node_info->rank, 2, MPI_COMM_WORLD));
         }
     }
 }
@@ -111,44 +107,29 @@ void get_ipaddress(char* hostname, char* ipstr)
     freeaddrinfo(res); // free the linked list
 }
 
-void get_peer_rank(int my_group, int group_rank, char* myhostname, int* my_peer, char** my_peer_host,
-    char* my_ipaddr, char* peer_ipaddr)
+void get_peer_info(int my_group, int group_rank, char* myhostname, char* myipaddress,
+    struct node_info* world_node_info, struct node_info** p_my_node_info, struct node_info** p_peer_node_info)
 {
-    // do allgather to find out the peers
-    struct node_info
-    {
-        int group_id;
-        int group_rank;
-        char hostname[MAX_HOST_SZ];
-    };
-
-    // identify peer node
-    *my_peer = -1;
-    *my_peer_host = NULL;
-
     struct node_info my_node_info = { 0 };
     my_node_info.group_id = my_group;
     my_node_info.group_rank = group_rank;
-    memcpy(my_node_info.hostname, myhostname, strlen(myhostname));
+    my_node_info.rank = world_rank;
 
-    struct node_info* world_node_info = (struct node_info*)malloc(sizeof(struct node_info) * world_size);
-    memset(world_node_info, 0, sizeof(struct node_info) * world_size);
+    memcpy(my_node_info.hostname, myhostname, strlen(myhostname));
+    memcpy(my_node_info.ipaddress, myipaddress, strlen(myipaddress));
 
     MPI_Allgather(&my_node_info, sizeof(struct node_info), MPI_BYTE,
         world_node_info, sizeof(struct node_info), MPI_BYTE, MPI_COMM_WORLD);
+
+    *p_my_node_info = (struct node_info*)world_node_info + world_rank;
     for (int i = 0; i < world_size; i++)
     {
         struct node_info* info = (struct node_info*)world_node_info + i;
         if (info->group_id != my_group && info->group_rank == group_rank)
         {
-            *my_peer = i;
-            *my_peer_host = info->hostname;
-            break;
+            *p_peer_node_info = info;
         }
     }
-
-    get_ipaddress(myhostname, my_ipaddr);
-    get_ipaddress(*my_peer_host, peer_ipaddr);
 }
 
 void posix_memalign(void** buffer, size_t alignment, size_t buffer_sz)
@@ -241,7 +222,7 @@ int main(int argc, char** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
     node_local_rank = world_rank / 8;
-    char* group1_hostnames = NULL;
+    char* group1_ipaddresses = NULL;
 
     bench_options.use_dotnet = 0;
     bench_options.uni_dir = 1;
@@ -261,8 +242,8 @@ int main(int argc, char** argv)
         }
 
         // read group1 hostnames
-        group1_hostnames = (char*)malloc(group_size * MAX_HOST_SZ);
-        memset(group1_hostnames, 0, group_size * MAX_HOST_SZ);
+        group1_ipaddresses = (char*)malloc(group_size * MAX_HOST_SZ);
+        memset(group1_ipaddresses, 0, group_size * MAX_HOST_SZ);
 
         FILE* fptr = NULL;
         fptr = fopen(group1_hostfile, "r");
@@ -272,7 +253,7 @@ int main(int argc, char** argv)
             MPI_Abort(MPI_COMM_WORLD, -1);
         }
 
-        while (fgets(group1_hostnames + i * MAX_HOST_SZ, MAX_HOST_SZ, fptr))
+        while (fgets(group1_ipaddresses + i * MAX_HOST_SZ, MAX_HOST_SZ, fptr))
             i++;
     }
 
@@ -283,19 +264,21 @@ int main(int argc, char** argv)
     MPI_Bcast(&group_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (world_rank != 0)
     {
-        group1_hostnames = (char*)malloc(group_size * MAX_HOST_SZ);
-        memset(group1_hostnames, 0, group_size * MAX_HOST_SZ);
+        group1_ipaddresses = (char*)malloc(group_size * MAX_HOST_SZ);
+        memset(group1_ipaddresses, 0, group_size * MAX_HOST_SZ);
     }
-    MPI_Bcast(group1_hostnames, group_size * MAX_HOST_SZ, MPI_CHAR, 0, MPI_COMM_WORLD);
+    MPI_Bcast(group1_ipaddresses, group_size * MAX_HOST_SZ, MPI_CHAR, 0, MPI_COMM_WORLD);
 
     int name_len;
     char myhostname[MAX_HOST_SZ] = { 0 };
+    char my_ipaddr[MAX_HOST_SZ] = { 0 };
     MPI_Get_processor_name(myhostname, &name_len);
-
+    get_ipaddress(myhostname, &my_ipaddr[0]);
+    
     // identify if i am in group1 or not
     for (int i = 0; i < group_size; i++)
     {
-        if (strnicmpL(myhostname, group1_hostnames + i * MAX_HOST_SZ, name_len) == 0)
+        if (my_strnicmp(my_ipaddr, group1_ipaddresses + i * MAX_HOST_SZ, MAX_HOST_SZ) == 0)
         {
             my_group = 1;
         }
@@ -307,16 +290,15 @@ int main(int argc, char** argv)
     MPI_Comm_size(group_comm, &group_size);
     MPI_Comm_rank(group_comm, &group_rank);
 
-    // identify peer node
-    int my_peer = -1;
-    char* my_peer_host = NULL;
-    char my_ipaddr[MAX_HOST_SZ] = { 0 };
-    char peer_ipaddr[MAX_HOST_SZ] = { 0 };
-
-    get_peer_rank(my_group, group_rank, (char*)myhostname, &my_peer, &my_peer_host, my_ipaddr, peer_ipaddr);
+    struct node_info* my_node_info = NULL;
+    struct node_info* peer_node_info = NULL;
+    struct node_info* world_node_info = (struct node_info*)malloc(sizeof(struct node_info) * world_size);
+    memset(world_node_info, 0, sizeof(struct node_info) * world_size);
+    get_peer_info(my_group, group_rank, myhostname, my_ipaddr, world_node_info, &my_node_info, &peer_node_info);
 
     fprintf(stderr, "INFO: %s, rank %d out of %d ranks, my_group: %d, group_size: %d, group_rank: %d, my_peer: %d, hostname: %s (%s), peer_host: %s (%s)\n",
-        myhostname, world_rank, world_size, my_group, group_size, group_rank, my_peer, myhostname, my_ipaddr, my_peer_host, peer_ipaddr);
+        my_node_info->hostname, world_rank, world_size, my_node_info->group_id, group_size, group_rank,
+        peer_node_info->rank, &my_node_info->hostname[0], &my_node_info->ipaddress[0], &peer_node_info->hostname[0], &peer_node_info->ipaddress[0]);
 
     void* buffer_tx, * buffer_rx;
     int buff_len = bench_options.buff_sz;
@@ -352,8 +334,7 @@ int main(int argc, char** argv)
 
         t_start = MPI_Wtime();
 
-        do_mpi_benchmark_unidir(my_group, world_rank, my_peer, my_peer_host, myhostname,
-            bench_options.iters, buffer_tx, buffer_rx, buff_len);
+        do_mpi_benchmark_unidir(my_node_info, peer_node_info, bench_options.iters, buffer_tx, buffer_rx, buff_len);
 
         t_end_local = MPI_Wtime();
         my_time = t_end_local - t_start;
@@ -367,7 +348,7 @@ int main(int argc, char** argv)
             // format: Timestamp:datetime,JobId:string,Rank:int,VMCount:int,LocalIP:string,RemoteIP:string,NumOfFlows:int,BufferSize:int,NumOfBuffers:int,TimeTakenms:real,RunId:int
             fprintf(log_fp, "%s,%s,%d,%d,%s,%s,%d,%d,%d,%.2lf,%lld\n",
                 formatted_time, bench_options.uuid, world_rank, world_size / bench_options.ppn,
-                my_ipaddr, peer_ipaddr, bench_options.ppn, buff_len,
+                my_ipaddr, peer_node_info->ipaddress, bench_options.ppn, buff_len,
                 bench_options.iters, my_time * 1000.0, run_idx);
         }
 
@@ -388,12 +369,10 @@ int main(int argc, char** argv)
     if (log_fp != NULL)
         fclose(log_fp);
 
-    if (!bench_options.use_dotnet)
-    {
-        _aligned_free(buffer_tx);
-        _aligned_free(buffer_rx);
-    }
-    MPI_Barrier(MPI_COMM_WORLD);
+    free(world_node_info);
+    _aligned_free(buffer_tx);
+    _aligned_free(buffer_rx);
 
+    MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
 }
