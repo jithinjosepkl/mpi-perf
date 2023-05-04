@@ -254,7 +254,11 @@ int main(int argc, char** argv)
         }
 
         while (fgets(group1_ipaddresses + i * MAX_HOST_SZ, MAX_HOST_SZ, fptr))
+        {
+            char* buffer = group1_ipaddresses + i * MAX_HOST_SZ;
+            buffer[strcspn(buffer, "\n")] = '\0';
             i++;
+        }
     }
 
     // broadcase benchmark options
@@ -296,9 +300,10 @@ int main(int argc, char** argv)
     memset(world_node_info, 0, sizeof(struct node_info) * world_size);
     get_peer_info(my_group, group_rank, myhostname, my_ipaddr, world_node_info, &my_node_info, &peer_node_info);
 
-    fprintf(stderr, "INFO: %s, rank %d out of %d ranks, my_group: %d, group_size: %d, group_rank: %d, my_peer: %d, hostname: %s (%s), peer_host: %s (%s)\n",
+    fprintf(stdout, "INFO: %s, rank %d out of %d ranks, my_group: %d, group_size: %d, group_rank: %d, my_peer: %d, hostname: %s (%s), peer_host: %s (%s)\n",
         my_node_info->hostname, world_rank, world_size, my_node_info->group_id, group_size, group_rank,
         peer_node_info->rank, &my_node_info->hostname[0], &my_node_info->ipaddress[0], &peer_node_info->hostname[0], &peer_node_info->ipaddress[0]);
+    fflush(stdout);
 
     void* buffer_tx, * buffer_rx;
     int buff_len = bench_options.buff_sz;
